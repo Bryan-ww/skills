@@ -1,0 +1,7 @@
+1.大屏分阶段缓存
+2.app小程序图标放cdn服务器
+3.本地gis JSON数据放index.db
+4.本地gis JSON数据使用fetch url?导入，不直接import,减少包体积
+5.vite": "^4.3.3",升级vite8，rowndown配置
+6.ol图层阴影使用，使用多层style替换mask提高渲染性能，只算线，不算面GPU/CPU 画线的计算量极小，它只关心线段经过的极少数像素，而不是视口内的所有像素
+7.对于项目长期更迭较快，很多静态资源如图片没有被使用的，使用rollup-plugin-cleaner清除插件，使用vite-plugin-unused-files查看有哪些文件没有使用

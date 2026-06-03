@@ -1,0 +1,64 @@
+总体差异
+
+- 第一版的核心思路是“先靠 bundle 图谱保住一批明确导入的资源，再对源码和 dist 做全文字符串扫描，按文件名命中资源”；现在版改成了“先保留 bundle 图谱中的显式资源，再按文件类型解析引用语义，最后把引用还原成真实路径去匹配资源”。
+- 简单说，第一版更像“猜这个文件名是不是被用过”，现在版更像“分析这段代码最终会引用到哪个路径”。
+第一版思路
+
+- src 资源：先从构建产物里拿 asset.originalFileName 和 chunk modules，标记显式导入过的资源。
+- 动态引用：再扫源码文本，用“路径 token / 文件名 token”去碰候选资源；如果同名文件太多，再用父目录名做一次弱校验。
+- public 资源：扫 dist 文本，看里面有没有出现资源文件名或路径片段，再反推哪些 public 文件被用了。
+- 优点：实现简单，内存相对可控，接近“低成本兜底”。
+- 问题：本质还是文本层面的模糊命中，容易漏掉真实引用，也容易把同名文件误判成已使用。
+现在版思路
+
+- 配置层先把扫描目标扩展为 JS/TS/JSX/TSX/Vue/CSS/SCSS/Less ，并支持 helper 映射配置 helperPathResolvers ，见 UnusedStaticPluginOptions 。
+- 显式导入仍然优先靠 bundle 图谱保留，见 generateBundle 。
+- JS/TS 侧不再扫纯文本，而是用 TypeScript AST 提取 import/export 、 require() 、 import() 、 new URL() 、 import.meta.glob() 、模板字符串、字符串拼接和条件表达式，见 extractScriptReferences 和 evaluateExpressionPatterns 。
+- Vue 不再只把 .vue 当大文本处理，而是拆成 template/script/script setup/style 分别解析，见 extractTemplateReferences 和 extractReferencesByFileType 。
+- 样式资源单独识别 url() 和 @import ，见 extractCssReferences 。
+- 提取到的引用不会直接按文件名认领，而是先做 alias/helper/public 相对路径解析，再落到绝对路径或 glob 模式上，最后与真实资源集合做匹配，见 resolveAliasReference 、 expandPatternToAbsoluteCandidates 、 markReferenceUsage 。
+- closeBundle 里也把统计拆成 bundle保护 / 源码解析保护 / dist兜底保护 ，报告可读性比第一版更强，见 closeBundle 。
+检测思路对比
+
+- 第一版：资源 -> 抽文件名 -> 去文本里搜“像不像出现过”。
+- 现在版：源码/模板/样式 -> 抽引用表达式 -> 解析成真实路径模式 -> 去资源集合里精确匹配。
+- 第一版是“资源驱动、反向搜索”。
+- 现在版是“引用驱动、正向解析”。
+优化点对比
+
+- 覆盖面：
+  - 第一版主要擅长普通文件名和部分路径片段。
+  - 现在版明确覆盖 import/export 、 require 、 import() 、 new URL() 、 import.meta.glob() 、Vue 模板属性、绑定表达式、CSS url() 、 @import 。
+- 精度：
+  - 第一版容易因为同名文件产生误保护。
+  - 现在版按绝对路径或 glob 模式匹配，误判明显更少。
+- 动态路径能力：
+  - 第一版碰到 `foo/${id}.png` 这类写法基本只能靠碰运气。
+  - 现在版会把它转成 foo/*.png 这种模式再去匹配。
+- 项目适配性：
+  - 第一版对 getAssetsImage() 这种封装函数无能为力。
+  - 现在版支持 helper 根目录映射，你这个项目最关键的 getAssetsImage('x') -> public/assets/images/x 已经能接住。
+- Vue 支持：
+  - 第一版把 .vue 基本当普通文本扫。
+  - 现在版把 template 、 script 、 style 分开处理，更接近真实用法。
+- 路径解析：
+  - 第一版主要靠“文件名 + 父目录提示”。
+  - 现在版支持 alias、相对路径、 /src/... 、 /assets/... 、helper roots 等多种解析入口。
+- 报告维度：
+  - 第一版只有粗粒度“动态保护了多少个”。
+  - 现在版能区分 bundle 命中、源码解析命中、dist 兜底命中，便于你判断到底是哪一层生效。
+为什么现在版更适合你项目
+
+- 你项目里大量资源不是直接 import ，而是通过 getAssetsImage() 、 /assets/images/... 、模板绑定、style 内联背景图来用。
+- 这种模式下，第一版很容易“漏掉实际使用的资源”或“误保留同名资源”。
+- 现在版正好针对这些场景做了专项处理，所以和你的项目结构更贴合。
+仍然存在的边界
+
+- 现在版虽然比第一版准很多，但还不是“运行时真值分析”。
+- 如果路径完全由后端返回、用户配置生成、复杂函数调用链间接拼出来，插件仍然无法 100% 静态推断。
+- 这类场景还是要配 keep 或继续补 helperPathResolvers 。
+一句话总结
+
+- 第一版是“文本级模糊检测”。
+- 现在版是“语义级路径检测”。
+- 核心提升不只是“支持的文件更多”，而是“判定依据从文件名碰撞，升级成了引用解析”。

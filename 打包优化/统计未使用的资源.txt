@@ -1,0 +1,27 @@
+import { defineConfig } from 'vite'
+import findUnusedFiles from 'vite-plugin-unused-files'
+import fs from 'fs/promises'
+
+export default defineConfig({
+  plugins: [
+    findUnusedFiles({
+      include: ['src/**/*', 'public/**/*'],
+      fileTypes: ['png', 'jpg', 'svg', 'webp', 'ico'],
+      dryRun: true,
+      output: 'unused.json'
+    }),
+    {
+      name: 'show-unused-size',
+      async buildEnd() {
+        const list = JSON.parse(await fs.readFile('unused.json'))
+        let total = 0
+        for (const f of list) {
+          const { size } = await fs.stat(f)
+          total += size
+          console.log(`- ${f} | ${(size/1024).toFixed(2)}KB`)
+        }
+        console.log(`\n✅ 未使用资源总大小：${(total/1024/1024).toFixed(2)}MB`)
+      }
+    }
+  ]
+})

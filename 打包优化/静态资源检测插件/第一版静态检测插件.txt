@@ -1,0 +1,553 @@
+import fs from 'node:fs/promises';
+import path from 'node:path';
+import { StringDecoder } from 'node:string_decoder';
+import type { Plugin, ResolvedConfig } from 'vite';
+import type { OutputAsset, OutputBundle, OutputChunk } from 'rolldown';
+
+/**
+ * 未使用静态资源插件配置选项
+ */
+export interface UnusedStaticPluginOptions {
+  /** 源代码目录，默认 'src' */
+  srcDir?: string;
+  /** public 目录路径，默认 Vite 配置中的 config.publicDir 或 'public'，设置为 false 则不检查 */
+  publicDir?: string | false;
+  /** 包含的静态资源扩展名，如 .png, .jpg 等 */
+  includeExts?: string[];
+  /**
+   * 扫描动态引用的文本文件扩展名
+   * 建议：仅扫描 ['.vue'] 以获得最佳性能和内存表现。
+   * 如果项目中 JS 动态拼接路径较多，可增加 '.js', '.ts'。
+   */
+  dynamicRefTextExts?: string[];
+  /** 动态引用扫描的最大字节数限制，防止超大项目导致内存崩溃，默认 16MB */
+  dynamicRefMaxTextBytes?: number;
+  /** 强制保留的文件路径或正则表达式（命中则不删除） */
+  keep?: Array<string | RegExp>;
+  /** 忽略扫描的路径或正则表达式（命中则不进入扫描逻辑） */
+  ignore?: Array<string | RegExp>;
+  /** 是否在构建完成后删除 dist 目录中未使用的 public 资源，默认为 true */
+  deleteUnusedDistPublic?: boolean;
+  /** 是否在构建完成后删除源码中未使用的静态资源，默认为 false，建议观察报告后再手动开启 */
+  deleteUnusedSource?: boolean;
+  /** 测试运行模式，只生成报告，不执行实际删除文件操作 */
+  dryRun?: boolean;
+  /** 报告文件输出路径，设置为 false 则不生成报告，默认 'dist/unused-static-report.json' */
+  reportFile?: string | false;
+  /** 是否打印详细控制台日志 */
+  verbose?: boolean;
+}
+
+/**
+ * 资源基础信息结构
+ */
+interface ResourceInfo {
+  id: string; // 资源的绝对路径或唯一标识符
+  relPath: string; // 资源的相对路径（相对于项目根目录）
+  parentDir: string; // 资源的父目录名，用于在重名时进行路径上下文辅助校验
+}
+
+/**
+ * 插件运行时的内部状态存储
+ */
+interface RuntimeState {
+  config: ResolvedConfig | null; // Vite 解析后的配置对象
+  root: string; // 项目根目录
+  srcDirAbs: string; // 源码目录绝对路径
+  srcDirPrefixNorm: string; // 标准化后的源码目录前缀，用于快速匹配
+  publicDirAbs: string | null; // Public 目录绝对路径
+  outDirAbs: string; // 构建输出目录绝对路径
+  base: string; // Vite 配置的公共基础路径
+  usedSrcStatic: Set<string>; // 存储已确认被使用的资源绝对路径
+}
+
+/** 默认扫描的静态资源后缀 */
+const DEFAULT_EXTS = [
+  '.png',
+  '.jpg',
+  '.jpeg',
+  '.gif',
+  '.svg',
+  '.webp',
+  '.avif',
+  '.ico',
+  '.bmp',
+  '.tiff',
+  '.mp4',
+  '.webm',
+  '.mp3',
+  '.wav',
+  '.ogg',
+  '.pdf',
+  '.woff',
+  '.woff2',
+  '.ttf',
+  '.otf',
+];
+
+/** 识别文本文件的正则，用于扫描 dist 产物 */
+const TEXT_FILE_RE = /\.(html|css|js|mjs|cjs|json|txt|xml|webmanifest|map)$/i;
+
+/** 默认动态扫描的源码后缀，仅针对 .vue 以确保内存安全 */
+const DEFAULT_DYNAMIC_REF_TEXT_EXTS = ['.vue'];
+
+/**
+ * 标准化文件路径：统一斜杠方向，Windows 下转小写以处理大小写不敏感
+ */
+function normalizeFsPath(filePath: string): string {
+  const abs = path.resolve(filePath);
+  const slashed = abs.replace(/\\/g, '/');
+  return process.platform === 'win32' ? slashed.toLowerCase() : slashed;
+}
+
+/**
+ * 移除路径中的查询参数（如 ?url, ?raw）
+ */
+function stripQuery(id: string): string {
+  const q = id.indexOf('?');
+  return q >= 0 ? id.slice(0, q) : id;
+}
+
+/**
+ * 转换为 Posix 风格路径（斜杠 /）
+ */
+function toPosixPath(p: string): string {
+  return p.replace(/\\/g, '/');
+}
+
+/**
+ * 检查文件是否存在
+ */
+async function exists(filePath: string): Promise<boolean> {
+  try {
+    await fs.access(filePath);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * 根据用户配置检查路径是否应该被忽略
+ */
+function shouldIgnore(rel: string, ignore: Array<string | RegExp>): boolean {
+  for (let i = 0; i < ignore.length; i++) {
+    const rule = ignore[i];
+    if (typeof rule === 'string') {
+      if (rel.includes(rule)) return true;
+    } else if (rule.test(rel)) {
+      return true;
+    }
+  }
+  return false;
+}
+
+/**
+ * 根据用户配置检查路径是否应该强制保留
+ */
+function shouldKeep(rel: string, keep: Array<string | RegExp>): boolean {
+  for (let i = 0; i < keep.length; i++) {
+    const rule = keep[i];
+    if (typeof rule === 'string') {
+      if (rel.includes(rule)) return true;
+    } else if (rule.test(rel)) {
+      return true;
+    }
+  }
+  return false;
+}
+
+/**
+ * 递归遍历目录，获取所有符合后缀要求的静态资源文件绝对路径
+ */
+async function walkFiles(dirAbs: string, includeExts: Set<string>, ignore: Array<string | RegExp>, relBaseAbs?: string): Promise<string[]> {
+  if (!(await exists(dirAbs))) return [];
+  const out: string[] = [];
+  const stack = [dirAbs];
+  while (stack.length) {
+    const cur = stack.pop()!;
+    const entries = await fs.readdir(cur, { withFileTypes: true });
+    for (const entry of entries) {
+      const abs = path.join(cur, entry.name);
+      const rel = toPosixPath(path.relative(relBaseAbs ?? dirAbs, abs));
+      if (shouldIgnore(rel, ignore)) continue;
+      if (entry.isDirectory()) {
+        stack.push(abs);
+      } else if (entry.isFile()) {
+        const ext = path.extname(entry.name).toLowerCase();
+        if (includeExts.has(ext)) out.push(abs);
+      }
+    }
+  }
+  return out;
+}
+
+/**
+ * 递归遍历目录，获取所有待扫描的源码文本文件
+ */
+async function walkTextFiles(dirAbs: string, textExts: Set<string>, ignore: Array<string | RegExp>, relBaseAbs?: string): Promise<string[]> {
+  if (!(await exists(dirAbs))) return [];
+  const out: string[] = [];
+  const stack = [dirAbs];
+  while (stack.length) {
+    const cur = stack.pop()!;
+    const entries = await fs.readdir(cur, { withFileTypes: true });
+    for (const entry of entries) {
+      const abs = path.join(cur, entry.name);
+      const rel = toPosixPath(path.relative(relBaseAbs ?? dirAbs, abs));
+      if (shouldIgnore(rel, ignore)) continue;
+      if (entry.isDirectory()) {
+        stack.push(abs);
+      } else if (entry.isFile()) {
+        const ext = path.extname(entry.name).toLowerCase();
+        if (textExts.has(ext)) out.push(abs);
+      }
+    }
+  }
+  return out;
+}
+
+/**
+ * 遍历构建产物目录 (dist)，获取所有需要检查引用的文本文件（JS, CSS, HTML）
+ */
+async function walkDistTextFiles(dirAbs: string): Promise<string[]> {
+  if (!(await exists(dirAbs))) return [];
+  const stack = [dirAbs];
+  const out: string[] = [];
+  while (stack.length) {
+    const cur = stack.pop()!;
+    const entries = await fs.readdir(cur, { withFileTypes: true });
+    for (const entry of entries) {
+      const abs = path.join(cur, entry.name);
+      if (entry.isDirectory()) {
+        stack.push(abs);
+      } else if (entry.isFile() && TEXT_FILE_RE.test(entry.name)) {
+        out.push(abs);
+      }
+    }
+  }
+  return out;
+}
+
+/**
+ * 智能文件名匹配算法
+ * 核心优化：不再使用正则表达式进行全文匹配，而是通过“令牌提取 + Map O(1) 查找”来降低内存。
+ * 处理重名：如果多个资源同名，会通过匹配点前方的路径上下文（父目录名）进行二次确认。
+ */
+async function findSmartFilenames<T extends ResourceInfo>(
+  filesAbs: string[],
+  resources: T[],
+  maxBytes = Number.POSITIVE_INFINITY
+): Promise<{ found: Set<string>; bytes: number; truncated: boolean }> {
+  const foundIds = new Set<string>();
+  if (filesAbs.length === 0 || resources.length === 0) {
+    return { found: foundIds, bytes: 0, truncated: false };
+  }
+
+  // 构建精确文件名映射
+  const nameMap = new Map<string, T[]>();
+  // 预先准备 posix 风格的 relPath，便于路径前缀/后缀匹配
+  const resourcesWithPosix = resources.map((res) => ({
+    ...res,
+    posixRelPath: res.relPath.replace(/\\/g, '/'),
+  }));
+
+  for (const res of resourcesWithPosix) {
+    const name = path.basename(res.posixRelPath);
+    if (!nameMap.has(name)) nameMap.set(name, []);
+    nameMap.get(name)!.push(res);
+  }
+
+  let totalBytesRead = 0;
+  let truncated = false;
+  const chunkSize = 64 * 1024;
+  const buffer = Buffer.allocUnsafe(chunkSize);
+  const decoder = new StringDecoder('utf8');
+
+  // 提取路径和文件名的正则：包含字母、数字、点、横杠、下划线、斜杠
+  const PATH_TOKEN_RE = /[a-zA-Z0-9\._\-\/]+/g;
+  const processedTokens = new Set<string>();
+
+  for (const fileAbs of filesAbs) {
+    if (totalBytesRead >= maxBytes) {
+      truncated = true;
+      break;
+    }
+    let handle: any = null;
+    let carry = '';
+    try {
+      handle = await fs.open(fileAbs, 'r');
+      while (totalBytesRead < maxBytes) {
+        const readLimit = Math.min(chunkSize, maxBytes - totalBytesRead);
+        const { bytesRead } = await handle.read(buffer, 0, readLimit, null);
+        if (bytesRead === 0) break;
+
+        totalBytesRead += bytesRead;
+        const text = carry + decoder.write(buffer.subarray(0, bytesRead));
+
+        let match;
+        PATH_TOKEN_RE.lastIndex = 0;
+        while ((match = PATH_TOKEN_RE.exec(text)) !== null) {
+          const token = match[0];
+
+          if (processedTokens.has(token)) continue;
+          processedTokens.add(token);
+
+          if (token.includes('/')) {
+            // 场景 1：包含斜杠的路径（如 'icons/logo.png', 'weatherWarning/', 'v2/ops-'）
+            // 过滤掉无意义的短字符串
+            const clean = token.replace(/[\/\.\\]/g, '');
+            if (clean.length < 2) continue;
+
+            for (const res of resourcesWithPosix) {
+              if (res.posixRelPath.includes(token)) {
+                foundIds.add(res.id);
+              }
+            }
+          } else {
+            // 场景 2：纯文件名或单词（如 'logo.png'）
+            if (token.length < 3) continue;
+
+            const candidates = nameMap.get(token);
+            if (candidates) {
+              if (candidates.length === 1) {
+                foundIds.add(candidates[0].id);
+              } else {
+                // 重名文件：检查前文是否包含其父目录作为提示
+                const context = text.slice(Math.max(0, match.index - 64), match.index);
+                let matchedAnyHint = false;
+                for (const cand of candidates) {
+                  if (context.includes(cand.parentDir + '/') || context.includes(cand.parentDir + '\\')) {
+                    foundIds.add(cand.id);
+                    matchedAnyHint = true;
+                  }
+                }
+                if (!matchedAnyHint) {
+                  for (const cand of candidates) foundIds.add(cand.id);
+                }
+              }
+            }
+          }
+        }
+        carry = text.slice(-256);
+      }
+      decoder.end();
+    } catch {
+      // 忽略读取失败
+    } finally {
+      if (handle) await handle.close().catch(() => {});
+    }
+  }
+  return { found: foundIds, bytes: totalBytesRead, truncated };
+}
+
+/**
+ * 删除文件并递归清理变为空的父目录
+ */
+async function removeFileAndEmptyDirs(fileAbs: string, stopDirAbs: string): Promise<void> {
+  if (!(await exists(fileAbs))) return;
+  await fs.unlink(fileAbs);
+  let dir = path.dirname(fileAbs);
+  const stop = path.resolve(stopDirAbs);
+  // 向上递归删除空目录，直到到达指定的停止目录（如 src 或 outDir）
+  while (normalizeFsPath(dir).startsWith(normalizeFsPath(stop))) {
+    if (normalizeFsPath(dir) === normalizeFsPath(stop)) break;
+    const children = await fs.readdir(dir).catch(() => []);
+    if (children.length > 0) break;
+    await fs.rmdir(dir).catch(() => {});
+    dir = path.dirname(dir);
+  }
+}
+
+/**
+ * 主插件函数
+ */
+export function unusedStaticPlugin(options: UnusedStaticPluginOptions = {}): Plugin {
+  const includeExts = new Set((options.includeExts ?? DEFAULT_EXTS).map((e) => e.toLowerCase()));
+  const dynamicRefTextExts = new Set((options.dynamicRefTextExts ?? DEFAULT_DYNAMIC_REF_TEXT_EXTS).map((e) => e.toLowerCase()));
+  const keep = options.keep ?? [];
+  const ignore = options.ignore ?? ['.git', 'node_modules', '.DS_Store'];
+
+  const state: RuntimeState = {
+    config: null,
+    root: process.cwd(),
+    srcDirAbs: '',
+    srcDirPrefixNorm: '',
+    publicDirAbs: null,
+    outDirAbs: '',
+    base: '/',
+    usedSrcStatic: new Set(),
+  };
+
+  const dryRun = options.dryRun ?? false;
+  const dynamicRefMaxTextBytes = options.dynamicRefMaxTextBytes ?? 16 * 1024 * 1024;
+  const deleteUnusedDistPublic = options.deleteUnusedDistPublic ?? true;
+  const deleteUnusedSource = options.deleteUnusedSource ?? false;
+  const verbose = options.verbose ?? true;
+
+  return {
+    name: 'vite-unused-static',
+    apply: 'build',
+    enforce: 'post', // 确保在资源转换完成后运行
+
+    /**
+     * Vite 配置解析完成后的初始化
+     */
+    configResolved(config) {
+      state.config = config;
+      state.root = config.root;
+      state.base = config.base || '/';
+      const srcDir = options.srcDir ?? 'src';
+      state.srcDirAbs = path.resolve(config.root, srcDir);
+      state.srcDirPrefixNorm = normalizeFsPath(state.srcDirAbs + path.sep);
+      const publicDir = options.publicDir ?? (config.publicDir === false ? false : config.publicDir || 'public');
+      state.publicDirAbs = publicDir === false ? null : path.resolve(config.root, publicDir);
+      state.outDirAbs = path.resolve(config.root, config.build.outDir || 'dist');
+    },
+
+    /**
+     * 捕获构建产物中的显式引用
+     * 这是最精准的一步：通过 Rolldown 的 Bundle 图谱识别已打包的资源
+     */
+    generateBundle(_outputOptions, bundle: OutputBundle) {
+      const srcPrefix = state.srcDirPrefixNorm;
+      for (const key in bundle) {
+        const item = bundle[key];
+        if (item.type === 'asset') {
+          // 检查 Asset（如直接导入的图片）
+          const original = (item as any).originalFileName || (item as any).originalFileNames;
+          const files = Array.isArray(original) ? original : original ? [original] : [];
+          for (const raw of files) {
+            const abs = normalizeFsPath(path.isAbsolute(raw) ? raw : path.resolve(state.root, raw));
+            if (abs.startsWith(srcPrefix)) state.usedSrcStatic.add(abs);
+          }
+        } else {
+          // 检查 Chunk 依赖的所有模块
+          for (const moduleId in item.modules) {
+            if (moduleId.includes('node_modules')) continue;
+            const noQuery = stripQuery(moduleId);
+            if (includeExts.has(path.extname(noQuery).toLowerCase())) {
+              const abs = normalizeFsPath(path.isAbsolute(noQuery) ? noQuery : path.resolve(state.root, noQuery));
+              if (abs.startsWith(srcPrefix)) state.usedSrcStatic.add(abs);
+            }
+          }
+        }
+      }
+    },
+
+    /**
+     * 打包彻底完成后执行最后的分析逻辑
+     * 此时 Vite 已经释放了转换阶段的大量内存，我们可以进行相对消耗资源的文件扫描
+     */
+    async closeBundle() {
+      // 1. 全量扫描当前硬盘上的静态资源文件
+      const allSrcStatic = await walkFiles(state.srcDirAbs, includeExts, ignore, state.root);
+      const srcByNorm = new Map(allSrcStatic.map((abs) => [normalizeFsPath(abs), abs]));
+
+      let allPublicStaticRel: string[] = [];
+      if (state.publicDirAbs) {
+        const abs = await walkFiles(state.publicDirAbs, includeExts, ignore, state.publicDirAbs);
+        allPublicStaticRel = abs.map((f) => toPosixPath(path.relative(state.publicDirAbs!, f)));
+      }
+
+      let protectedByDynamicRefs = 0;
+
+      // 2. 进行“源码动态检测”：扫描 .vue 文件查找字符串形式的隐藏引用
+      const sourceTextFiles = await walkTextFiles(state.srcDirAbs, dynamicRefTextExts, ignore, state.root);
+      if (sourceTextFiles.length) {
+        const candidates: ResourceInfo[] = [];
+        for (const abs of allSrcStatic) {
+          const norm = normalizeFsPath(abs);
+          if (!state.usedSrcStatic.has(norm)) {
+            candidates.push({
+              id: norm,
+              relPath: toPosixPath(path.relative(state.root, abs)),
+              parentDir: path.basename(path.dirname(abs)),
+            });
+          }
+        }
+        // 扫描结果存入 usedSrcStatic
+        const scan = await findSmartFilenames(sourceTextFiles, candidates, dynamicRefMaxTextBytes);
+        for (const id of scan.found) {
+          state.usedSrcStatic.add(id);
+          protectedByDynamicRefs++;
+        }
+      }
+
+      // 计算源码中最终未使用的资源
+      const unusedSrcNorm = allSrcStatic
+        .map((f) => normalizeFsPath(f))
+        .filter((norm) => {
+          if (state.usedSrcStatic.has(norm)) return false;
+          const rel = toPosixPath(path.relative(state.root, srcByNorm.get(norm) ?? norm));
+          return !shouldKeep(rel, keep);
+        });
+      const unusedSrcRel = unusedSrcNorm.map((norm) => toPosixPath(path.relative(state.root, srcByNorm.get(norm) ?? norm)));
+
+      // 3. 进行“Public 资源检测”：扫描构建产物 (dist) 查找对 public 资源的引用
+      const distTextFiles = await walkDistTextFiles(state.outDirAbs);
+      const publicCandidates = allPublicStaticRel.map((rel) => ({
+        id: rel,
+        relPath: rel,
+        parentDir: path.basename(path.dirname(rel)) || 'public',
+      }));
+      const usedPublicRel = (await findSmartFilenames(distTextFiles, publicCandidates)).found;
+      const unusedPublicRel = allPublicStaticRel.filter((rel) => !usedPublicRel.has(rel) && !shouldKeep(`public/${rel}`, keep));
+
+      // 4. 执行实际的物理删除操作
+      const removedDistPublic: string[] = [];
+      if (!dryRun && deleteUnusedDistPublic) {
+        for (const rel of unusedPublicRel) {
+          const fileAbs = path.join(state.outDirAbs, rel);
+          if (await exists(fileAbs)) {
+            await removeFileAndEmptyDirs(fileAbs, state.outDirAbs);
+            removedDistPublic.push(toPosixPath(path.relative(state.root, fileAbs)));
+          }
+        }
+      }
+      const removedSource: string[] = [];
+      if (!dryRun && deleteUnusedSource) {
+        for (const norm of unusedSrcNorm) {
+          const abs = srcByNorm.get(norm) ?? norm;
+          if (await exists(abs)) {
+            await removeFileAndEmptyDirs(abs, state.srcDirAbs);
+            removedSource.push(toPosixPath(path.relative(state.root, abs)));
+          }
+        }
+      }
+
+      // 5. 生成 JSON 报告
+      const report = {
+        scannedAt: new Date().toISOString(),
+        totals: {
+          unusedSrc: unusedSrcRel.length,
+          unusedPublic: unusedPublicRel.length,
+          protectedByDynamicRefs,
+        },
+        unused: {
+          src: unusedSrcRel,
+          public: unusedPublicRel.map((f) => `public/${f}`),
+        },
+        removed: {
+          distPublic: removedDistPublic,
+          source: removedSource,
+        },
+      };
+      if (options.reportFile !== false) {
+        const file = path.resolve(state.root, options.reportFile ?? 'dist/unused-static-report.json');
+        await fs.mkdir(path.dirname(file), { recursive: true });
+        await fs.writeFile(file, JSON.stringify(report, null, 2), 'utf8');
+      }
+
+      // 6. 控制台日志输出
+      if (verbose) {
+        console.log(
+          `[vite-unused-static] 动态引用保护=${protectedByDynamicRefs}, 未使用源码资源=${unusedSrcRel.length}, 未使用 public 资源=${unusedPublicRel.length}`
+        );
+      }
+
+      // 7. 显式清理状态，释放内存
+      state.usedSrcStatic.clear();
+    },
+  };
+}

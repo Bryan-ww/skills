@@ -1,0 +1,91 @@
+import { defineConfig } from 'vite';
+import vue from '@vitejs/plugin-vue';
+import { unusedStaticPlugin } from './vite-plugin-unused-static';
+
+/**
+ * 这是一个关于如何使用 vite-plugin-unused-static 插件的配置示例。
+ * 你可以将此配置集成到你的 vite.config.ts 中。
+ */
+export default defineConfig({
+  plugins: [
+    vue(),
+    unusedStaticPlugin({
+      /**
+       * 1) 源码目录配置
+       * 插件将在此目录下扫描静态资源和待检查的文本文件。
+       */
+      srcDir: 'src',
+
+      /**
+       * 2) Public 目录配置
+       * 插件会分析构建产物中是否引用了 public 目录下的文件。
+       * 如果设为 false，则不检查 public 目录。
+       */
+      publicDir: 'public',
+
+      /**
+       * 3) 资源后缀过滤
+       * 只有符合这些后缀的文件才会被纳入“未使用资源”的统计范围。
+       */
+      includeExts: ['.png', '.jpg', '.jpeg', '.gif', '.svg', '.webp', '.avif', '.ico', '.woff', '.woff2', '.ttf', '.otf', '.mp3', '.mp4'],
+
+      /**
+       * 4) 扫描文本后缀
+       * 插件会扫描这些文件的内容，查找是否存在静态资源的“文件名”引用。
+       * 建议：仅保留 ['.vue'] 以获得最佳性能。如果 JS 逻辑中拼接路径较多，可加入 '.js', '.ts'。
+       */
+      dynamicRefTextExts: ['.vue', '.js'],
+
+      /**
+       * 5) 忽略路径
+       * 匹配到的路径将完全不被插件处理（既不统计，也不扫描）。
+       */
+      ignore: ['src/assets/keep', /\/mock\//],
+
+      /**
+       * 6) 强制保留 (白名单)
+       * 如果某些资源是通过后端接口下发路径或极端动态拼接的，请在此配置。
+       * 命中白名单的资源即使未检测到引用，也不会被删除。
+       */
+      keep: ['src/assets/runtime', /^public\/cdn\//],
+
+      /**
+       * 7) 内存保护限制
+       * 动态扫描文本时的最大字节数（默认 16MB）。
+       * 针对超大型项目，这可以防止 Node.js 在分析过程中内存溢出。
+       */
+      dynamicRefMaxTextBytes: 16 * 1024 * 1024,
+
+      /**
+       * 8) 构建产物清理
+       * 构建完成后，是否自动删除 dist 目录中未被引用的 public 资源。
+       */
+      deleteUnusedDistPublic: true,
+
+      /**
+       * 9) 源码清理 (高风险)
+       * 是否直接从磁盘删除源码中未使用的资源。
+       * 警告：建议先通过报告确认无误后，再将此项设为 true。
+       */
+      deleteUnusedSource: false,
+
+      /**
+       * 10) 测试运行模式
+       * 如果设为 true，插件只生成报告并打印日志，不会执行任何物理删除操作。
+       */
+      dryRun: false,
+
+      /**
+       * 11) 报告输出
+       * 扫描结果的 JSON 报告路径。
+       */
+      reportFile: 'dist/unused-static-report.json',
+
+      /**
+       * 12) 日志输出
+       * 是否在终端打印扫描统计摘要。
+       */
+      verbose: true,
+    }),
+  ],
+});
